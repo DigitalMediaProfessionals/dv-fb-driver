@@ -20,7 +20,6 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
-#include <linux/cdev.h>
 #include <linux/io.h>
 #include <linux/err.h>
 #include <linux/stddef.h>
@@ -36,30 +35,43 @@
 #include <linux/dma-mapping.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
-#include <uapi/linux/fb.h>
+#include <linux/fb.h>
 #include "pdc.h"
 
+//#define USE_DEVTREE
+#ifndef USE_DEVTREE
+#ifdef DMP_ZC706
+static unsigned int reg_prop[] = { 0x43c10000, 0x100 };
+static int irq_prop = 50;
+#else
+//TODO
+#endif
+#endif
+
 #define REG_ADDR(PA, OF) ((void __iomem *)(PA) + OF)
+#define ALLOC_SIZE() (width * height * ((bpp == 32) ? 4 : 3) * 2)
 #define FB_DEV_NAME "dmp_fb"
 #define FB_NUM_SUBDEV 1
+
+#define RED_SHIFT	16
+#define GREEN_SHIFT	8
+#define BLUE_SHIFT	0
+#define PALETTE_ENTRIES_NO	16
 
 // module arguments: these can be modified on module loading:
 // e.g: insmod **_km.ko width=1280 height=720
 static int width = 1280;
 static int height = 720;
-static int pol = 0;
+static int pol = 4;
 static int bpp = 32;
-static int fbn = 0;
 module_param(width, int, 0644);
 module_param(height, int, 0644);
 module_param(pol, int, 0644);
 module_param(bpp, int, 0644);
-module_param(fbn, int, 0644);
 MODULE_PARM_DESC(width, "frame buffer width");
 MODULE_PARM_DESC(height, "frame buffer height");
 MODULE_PARM_DESC(pol, "sync polarity");
 MODULE_PARM_DESC(bpp, "specify bits-per-pixel (default=32)");
-MODULE_PARM_DESC(fbn, "device node num to create (/dev/fbN (default = fb0)");
 
 struct fb_subdev {
 	int init_done;
@@ -73,17 +85,14 @@ struct fb_subdev {
 
 	dma_addr_t fb_pa;
 	void *fb_la;
-	struct fb_var_screeninfo fb_sci;
+	struct fb_info info;
+	u32 pseudo_palette[PALETTE_ENTRIES_NO];
 };
 
 struct fb_dev {
 	struct device *dev;
-	dev_t devt;
-	struct cdev cdev;
 	struct fb_subdev subdev[FB_NUM_SUBDEV];
 };
-
-static struct class *fb_class = NULL;
 
 static irqreturn_t handle_int(int irq, void *p)
 {
@@ -101,8 +110,8 @@ static irqreturn_t handle_int(int irq, void *p)
 	spin_lock(&subdev->int_lock);
 	if (subdev->wait_status == 1) { // user waiting for int/swap
 		next_fba = subdev->fb_pa +
-			   (subdev->fb_sci.yoffset * subdev->fb_sci.xres *
-			    (subdev->fb_sci.bits_per_pixel >> 3));
+			   (subdev->info.var.yoffset * subdev->info.var.xres *
+			    (subdev->info.var.bits_per_pixel >> 3));
 
 		iowrite32(0x8 | 1, REG_ADDR(subdev->bar_logical, 0x94));
 		iowrite32(next_fba,
@@ -134,39 +143,63 @@ static void wait_int(struct fb_subdev *subdev)
 	}
 }
 
-static int fb_open(struct inode *inode, struct file *file)
+static int dvfb_setcolreg(unsigned int regno, unsigned int red,
+			  unsigned int green, unsigned int blue,
+			  unsigned int transp, struct fb_info *info)
 {
-	struct fb_dev *fb_dev =
-		container_of(inode->i_cdev, struct fb_dev, cdev);
-	file->private_data = &fb_dev->subdev[iminor(inode)];
+	u32 *palette = info->pseudo_palette;
+
+	if (regno >= PALETTE_ENTRIES_NO)
+		return -EINVAL;
+
+	if (info->var.grayscale) {
+		// Convert color to grayscale.
+		// grayscale = 0.30*R + 0.59*G + 0.11*B
+		blue = (red * 77 + green * 151 + blue * 28 + 127) >> 8;
+		green = blue;
+		red = green;
+	}
+
+	// Only handle 8 bits of each color
+	red >>= 8;
+	green >>= 8;
+	blue >>= 8;
+	palette[regno] = (red << RED_SHIFT) | (green << GREEN_SHIFT) |
+			 (blue << BLUE_SHIFT);
+
 	return 0;
 }
 
-static int fb_release(struct inode *inode, struct file *file)
+static int dvfb_blank(int blank, struct fb_info *info)
 {
+	struct fb_subdev *subdev = container_of(info, struct fb_subdev, info);
+
+	switch (blank) {
+	case FB_BLANK_UNBLANK:
+		/* turn on display */
+		pdc_start(subdev->bar_logical);
+		break;
+
+	case FB_BLANK_NORMAL:
+	case FB_BLANK_VSYNC_SUSPEND:
+	case FB_BLANK_HSYNC_SUSPEND:
+	case FB_BLANK_POWERDOWN:
+		/* turn off display */
+		pdc_stop(subdev->bar_logical);
+		break;
+	default:
+		break;
+	}
+
 	return 0;
 }
 
-static long fb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+static int dvfb_ioctl(struct fb_info *info, unsigned int cmd, unsigned long arg)
 {
 	unsigned int ret = 0;
-	struct fb_subdev *subdev = file->private_data;
-	unsigned int __user *ptr = (unsigned int __user *)arg;
-	struct fb_var_screeninfo fb_sci;
+	struct fb_subdev *subdev = container_of(info, struct fb_subdev, info);
 
 	switch (cmd) {
-	case FBIOGET_VSCREENINFO: {
-		ret = copy_to_user(ptr, &(subdev->fb_sci),
-				   sizeof(struct fb_var_screeninfo));
-		break;
-	}
-	case FBIOPAN_DISPLAY: { // assume that caller has reset yoffset
-		ret = copy_from_user(&fb_sci, ptr,
-				     sizeof(struct fb_var_screeninfo));
-		if (ret == 0)
-			subdev->fb_sci.yoffset = fb_sci.yoffset;
-		break;
-	}
 	case FBIO_WAITFORVSYNC: {
 		wait_int(subdev);
 		ret = 0;
@@ -179,30 +212,35 @@ static long fb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	return ret;
 }
 
-static int fb_mmap(struct file *file, struct vm_area_struct *vma)
-{
-	struct fb_subdev *subdev = file->private_data;
-	unsigned long map_size = vma->vm_end - vma->vm_start;
-	if (map_size != width * height * 2 * ((bpp == 32) ? 4 : 3))
-		return -EINVAL;
-
-	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
-	return io_remap_pfn_range(vma, vma->vm_start,
-				  (subdev->fb_pa >> PAGE_SHIFT), map_size,
-				  vma->vm_page_prot);
-}
-
-static struct file_operations fb_file_ops = {
-	.owner = THIS_MODULE,
-	.open = fb_open,
-	.release = fb_release,
-	.unlocked_ioctl = fb_ioctl,
-	.mmap = fb_mmap,
+static const struct fb_fix_screeninfo dvfb_fix = {
+	.id =		FB_DEV_NAME,
+	.type =		FB_TYPE_PACKED_PIXELS,
+	.visual =	FB_VISUAL_TRUECOLOR,
+	.accel =	FB_ACCEL_NONE,
 };
 
-static int fb_allocate_buffer(struct fb_dev *fb_dev)
+static const struct fb_var_screeninfo dvfb_var = {
+	.red =		{ RED_SHIFT, 8, 0 },
+	.green =	{ GREEN_SHIFT, 8, 0 },
+	.blue =		{ BLUE_SHIFT, 8, 0 },
+	.transp =	{ 0, 0, 0 },
+	.activate =	FB_ACTIVATE_NOW
+};
+
+static struct fb_ops dvfb_ops = {
+	.owner			= THIS_MODULE,
+	.fb_setcolreg		= dvfb_setcolreg,
+	.fb_blank		= dvfb_blank,
+	//.fb_pan_display	= dvfb_pan_display,	TODO
+	.fb_fillrect		= cfb_fillrect,
+	.fb_copyarea		= cfb_copyarea,
+	.fb_imageblit		= cfb_imageblit,
+	.fb_ioctl		= dvfb_ioctl,
+};
+
+static int allocate_fb(struct fb_dev *fb_dev)
 {
-	size_t alloc_size = width * height * ((bpp == 32) ? 4 : 3) * 2;
+	size_t alloc_size = ALLOC_SIZE();
 
 	if (dma_set_mask_and_coherent(fb_dev->dev, DMA_BIT_MASK(32))) {
 		dev_err(fb_dev->dev, "No suitable DMA available.\n");
@@ -222,11 +260,19 @@ static int fb_allocate_buffer(struct fb_dev *fb_dev)
 	return 0;
 }
 
+static void free_fb(struct fb_dev *fb_dev)
+{
+	size_t alloc_size = ALLOC_SIZE();
+	dma_free_coherent(fb_dev->dev, alloc_size, fb_dev->subdev[0].fb_la,
+			  fb_dev->subdev[0].fb_pa);
+}
+
 static int pdc_init(struct fb_dev *fb_dev)
 {
 	struct fb_subdev *subdev = &fb_dev->subdev[0];
 	int pdc_dim[5];
 	dma_addr_t fb_pa[2];
+	int ret;
 
 	pdc_dim[0] = width;
 	pdc_dim[1] = height;
@@ -234,17 +280,7 @@ static int pdc_init(struct fb_dev *fb_dev)
 	pdc_dim[3] = height;
 	pdc_dim[4] = (pol & 0xffff) | ((bpp == 32) ? 0x40000 : 0x30000);
 
-	// fill in supported areas of fb_screen_info:
-	subdev->fb_sci.xres = width;
-	subdev->fb_sci.yres = height;
-	subdev->fb_sci.xres_virtual = width;
-	subdev->fb_sci.yres_virtual = height * 2;
-	subdev->fb_sci.xoffset = 0;
-	subdev->fb_sci.yoffset = 0;
-	subdev->fb_sci.bits_per_pixel = bpp;
-	subdev->fb_sci.grayscale = 0;
-
-	if (0 != fb_allocate_buffer(fb_dev)) {
+	if (0 != allocate_fb(fb_dev)) {
 		dev_err(fb_dev->dev, "Failed to allocate FB buffer.\n");
 		return -ENOMEM;
 	}
@@ -254,18 +290,57 @@ static int pdc_init(struct fb_dev *fb_dev)
 	pdc_config(subdev->bar_logical, pdc_dim, fb_pa);
 	pdc_start(subdev->bar_logical);
 
+	// fill in fb_info
+	subdev->info.device = fb_dev->dev;
+	subdev->info.screen_base = (void __iomem *)subdev->fb_la;
+	subdev->info.fbops = &dvfb_ops;
+	subdev->info.pseudo_palette = subdev->pseudo_palette;
+	subdev->info.flags = FBINFO_DEFAULT;
+
+	subdev->info.fix = dvfb_fix;
+	subdev->info.fix.smem_start = subdev->fb_pa;
+	subdev->info.fix.smem_len = ALLOC_SIZE();
+	subdev->info.fix.line_length = width * ((bpp == 32) ? 4 : 3);
+
+	subdev->info.var = dvfb_var;
+	subdev->info.var.xres = width;
+	subdev->info.var.yres = height;
+	subdev->info.var.xres_virtual = width;
+	subdev->info.var.yres_virtual = height * 2;
+	subdev->info.var.xoffset = 0;
+	subdev->info.var.yoffset = 0;
+	subdev->info.var.bits_per_pixel = bpp;
+	subdev->info.var.grayscale = 0;
+
+	// allocate color map
+	ret = fb_alloc_cmap(&subdev->info.cmap, PALETTE_ENTRIES_NO, 0);
+	if (ret) {
+		dev_err(fb_dev->dev, "Fail to allocate colormap (%d entries)\n",
+			PALETTE_ENTRIES_NO);
+		free_fb(fb_dev);
+		return ret;
+	}
+	
+	// register new frame buffer
+	ret = register_framebuffer(&subdev->info);
+	if (ret) {
+		dev_err(fb_dev->dev, "Could not register frame buffer\n");
+		fb_dealloc_cmap(&subdev->info.cmap);
+		free_fb(fb_dev);
+		return ret;
+	}
+
 	return 0;
 }
 
-static int fb_probe(struct platform_device *pdev, struct device_node *dev_node)
+static int dvfb_probe(struct platform_device *pdev, struct device_node *dev_node)
 {
 	struct fb_dev *fb_dev;
-	const unsigned int *prop = NULL;
 	phys_addr_t reg_base;
 	size_t reg_size;
-	int i, ret, pbytes, dev_major, irq;
+	int i, ret, irq;
 
-	fb_dev = kzalloc(sizeof(struct fb_dev), GFP_KERNEL);
+	fb_dev = devm_kzalloc(&pdev->dev, sizeof(struct fb_dev), GFP_KERNEL);
 	if (!fb_dev) {
 		dev_err(&pdev->dev, "Failed to allocate device data.\n");
 		return -ENOMEM;
@@ -273,17 +348,26 @@ static int fb_probe(struct platform_device *pdev, struct device_node *dev_node)
 	fb_dev->dev = &(pdev->dev);
 	platform_set_drvdata(pdev, fb_dev);
 
-	prop = of_get_property(dev_node, "reg", &pbytes);
-	if ((prop == NULL) || (pbytes < 8)) {
-		dev_err(&pdev->dev, "reg property not found\n");
-		ret = -ENODEV;
-		goto fail_get_property;
+#ifdef USE_DEVTREE
+	{
+		const unsigned int *prop = NULL;
+		int pbytes;
+		prop = of_get_property(dev_node, "reg", &pbytes);
+		if ((prop == NULL) || (pbytes < 8)) {
+			dev_err(&pdev->dev, "reg property not found\n");
+			ret = -ENODEV;
+			goto fail_ioremap;
+		}
+		// note that device-tree property data is big-endian:
+		reg_base = be32_to_cpup(prop);
+		reg_size = be32_to_cpup(prop + 1);
 	}
-	// note that device-tree property data is big-endian:
-	reg_base = be32_to_cpup(prop);
-	reg_size = be32_to_cpup(prop + 1);
-	pr_info(FB_DEV_NAME ": reg base=0x%08x size=0x%08x (prop=%d bytes)\n",
-		reg_base, reg_size, pbytes);
+#else
+	reg_base = reg_prop[0];
+	reg_size = reg_prop[1];
+#endif
+	pr_info(FB_DEV_NAME ": reg base=0x%08x size=0x%08x\n", reg_base,
+		reg_size);
 
 	fb_dev->subdev[0].wait_status = 0;
 	fb_dev->subdev[0].bar_physical = reg_base;
@@ -295,47 +379,18 @@ static int fb_probe(struct platform_device *pdev, struct device_node *dev_node)
 		goto fail_ioremap;
 	}
 
-	// create & register character device(s):
-	ret = alloc_chrdev_region(&fb_dev->devt, 0, FB_NUM_SUBDEV, FB_DEV_NAME);
-	if (ret) {
-		dev_err(&pdev->dev, "alloc_chrdev_region failed.\n");
-		goto fail_alloc_chrdev_region;
-	}
-
-	fb_class = class_create(THIS_MODULE, FB_DEV_NAME);
-	if (IS_ERR(fb_class)) {
-		dev_err(&pdev->dev, "class_create failed.\n");
-		ret = PTR_ERR(fb_class);
-		goto fail_class_create;
-	}
-
-	dev_major = MAJOR(fb_dev->devt);
-
-	cdev_init(&fb_dev->cdev, &fb_file_ops);
-	ret = cdev_add(&fb_dev->cdev, fb_dev->devt, FB_NUM_SUBDEV);
-	if (ret) {
-		dev_err(&pdev->dev, "cdev_add failed.\n");
-		goto fail_cdev_add;
-	}
-
 	for (i = 0; i < FB_NUM_SUBDEV; i++) {
-		struct device *dev;
-		dev = device_create(fb_class, NULL, MKDEV(dev_major, i), fb_dev,
-				    "fb%d", fbn + i);
-		if (IS_ERR(dev)) {
-			dev_err(&pdev->dev, "device_create fail\n");
-			ret = PTR_ERR(dev);
-			goto fail_device_init;
-		}
-
+#ifdef USE_DEVTREE
 		irq = of_irq_get(dev_node, 0);
+#else
+		irq = irq_prop;
+#endif
 		fb_dev->subdev[i].irq = irq;
 		ret = request_irq(irq, handle_int, IRQF_SHARED, FB_DEV_NAME,
 				  &fb_dev->subdev[i]);
 		if (ret != 0) {
 			dev_err(&pdev->dev, "request_irq failed %d (%d).\n",
 				irq, i);
-			device_destroy(fb_class, MKDEV(dev_major, i));
 			goto fail_device_init;
 		}
 
@@ -357,19 +412,11 @@ fail_device_init:
 	for (i = 0; i < FB_NUM_SUBDEV; i++) {
 		if (fb_dev->subdev[i].init_done) {
 			free_irq(fb_dev->subdev[i].irq, &(fb_dev->subdev[i]));
-			device_destroy(fb_class, MKDEV(dev_major, i));
 			fb_dev->subdev[i].init_done = 0;
 		}
 	}
-	cdev_del(&fb_dev->cdev);
-fail_cdev_add:
-	class_destroy(fb_class);
-fail_class_create:
-	unregister_chrdev_region(fb_dev->devt, FB_NUM_SUBDEV);
-fail_alloc_chrdev_region:
 	iounmap(fb_dev->subdev[0].bar_logical);
 fail_ioremap:
-fail_get_property:
 	kfree(fb_dev);
 	return ret;
 }
@@ -377,8 +424,9 @@ fail_get_property:
 static int dev_probe(struct platform_device *pdev)
 {
 	int err = 0;
-	struct device_node *dev_node;
+	struct device_node *dev_node = NULL;
 
+#ifdef USE_DEVTREE
 	dev_node = of_find_compatible_node(NULL, NULL, "DMP_fb,DMP_fb");
 	if (dev_node == NULL) {
 		dev_err(&pdev->dev, "No compatible node found.\n");
@@ -386,10 +434,11 @@ static int dev_probe(struct platform_device *pdev)
 	} else {
 		of_node_put(dev_node);
 	}
+#endif
 
-	err = fb_probe(pdev, dev_node);
+	err = dvfb_probe(pdev, dev_node);
 	if (0 != err) {
-		dev_err(&pdev->dev, "fb_probe failed.\n");
+		dev_err(&pdev->dev, "dvfb_probe failed.\n");
 		return err;
 	}
 
@@ -404,34 +453,22 @@ static int dev_remove(struct platform_device *pdev)
 	fb_dev = platform_get_drvdata(pdev);
 
 	if (fb_dev) {
-		unsigned int driver_major = MAJOR(fb_dev->devt);
-		size_t alloc_size = width * height * ((bpp == 32) ? 4 : 3) * 2;
-
-		dma_free_coherent(&pdev->dev, alloc_size,
-				  fb_dev->subdev[0].fb_la,
-				  fb_dev->subdev[0].fb_pa);
+		unregister_framebuffer(&fb_dev->subdev[0].info);
+		fb_dealloc_cmap(&fb_dev->subdev[0].info.cmap);
+		free_fb(fb_dev);
 
 		for (i = 0; i < FB_NUM_SUBDEV; i++) {
 			if (fb_dev->subdev[i].init_done) {
 				free_irq(fb_dev->subdev[i].irq,
 					 &(fb_dev->subdev[i]));
-				device_destroy(fb_class,
-					       MKDEV(driver_major, i));
 				fb_dev->subdev[i].init_done = 0;
 			}
-		}
-
-		cdev_del(&fb_dev->cdev);
-		class_destroy(fb_class);
-		unregister_chrdev_region(fb_dev->devt, FB_NUM_SUBDEV);
-		for (i = 0; i < FB_NUM_SUBDEV; i++) {
 			if (fb_dev->subdev[i].bar_logical) {
 				iounmap(fb_dev->subdev[i].bar_logical);
 			}
 		}
 
 		platform_set_drvdata(pdev, NULL);
-		kfree(fb_dev);
 	}
 
 	return 0;
