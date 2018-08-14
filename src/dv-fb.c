@@ -53,17 +53,17 @@ static int irq_prop = 50;
 #define FB_DEV_NAME "dmp_fb"
 #define FB_NUM_SUBDEV 1
 
-#define RED_SHIFT	16
-#define GREEN_SHIFT	8
-#define BLUE_SHIFT	0
 #define PALETTE_ENTRIES_NO	16
+static int RED_SHIFT = 16;
+static int GREEN_SHIFT = 8;
+static int BLUE_SHIFT = 0;
 
 // module arguments: these can be modified on module loading:
 // e.g: insmod **_km.ko width=1280 height=720
 static int width = 1280;
 static int height = 720;
 static int pol = 4;
-static int bpp = 32;
+static int bpp = 24;
 module_param(width, int, 0644);
 module_param(height, int, 0644);
 module_param(pol, int, 0644);
@@ -71,7 +71,7 @@ module_param(bpp, int, 0644);
 MODULE_PARM_DESC(width, "frame buffer width");
 MODULE_PARM_DESC(height, "frame buffer height");
 MODULE_PARM_DESC(pol, "sync polarity");
-MODULE_PARM_DESC(bpp, "specify bits-per-pixel (default=32)");
+MODULE_PARM_DESC(bpp, "specify bits-per-pixel (default=24)");
 
 struct fb_subdev {
 	int init_done;
@@ -220,9 +220,9 @@ static const struct fb_fix_screeninfo dvfb_fix = {
 };
 
 static const struct fb_var_screeninfo dvfb_var = {
-	.red =		{ RED_SHIFT, 8, 0 },
-	.green =	{ GREEN_SHIFT, 8, 0 },
-	.blue =		{ BLUE_SHIFT, 8, 0 },
+	.red =		{ 0, 8, 0 },
+	.green =	{ 0, 8, 0 },
+	.blue =		{ 0, 8, 0 },
 	.transp =	{ 0, 0, 0 },
 	.activate =	FB_ACTIVATE_NOW
 };
@@ -290,6 +290,12 @@ static int pdc_init(struct fb_dev *fb_dev)
 	pdc_config(subdev->bar_logical, pdc_dim, fb_pa);
 	pdc_start(subdev->bar_logical);
 
+	// set channel offset
+	if (bpp == 32) {
+		RED_SHIFT = 24;
+		GREEN_SHIFT = 16;
+		BLUE_SHIFT = 8;
+	}
 	// fill in fb_info
 	subdev->info.device = fb_dev->dev;
 	subdev->info.screen_base = (void __iomem *)subdev->fb_la;
@@ -309,6 +315,9 @@ static int pdc_init(struct fb_dev *fb_dev)
 	subdev->info.var.yres_virtual = height * 2;
 	subdev->info.var.xoffset = 0;
 	subdev->info.var.yoffset = 0;
+	subdev->info.var.red.offset = RED_SHIFT;
+	subdev->info.var.green.offset = GREEN_SHIFT;
+	subdev->info.var.blue.offset = BLUE_SHIFT;
 	subdev->info.var.bits_per_pixel = bpp;
 	subdev->info.var.grayscale = 0;
 
