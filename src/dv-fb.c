@@ -78,6 +78,7 @@ struct fb_subdev {
 	spinlock_t int_lock;
 	wait_queue_head_t wait_queue;
 	int wait_status;
+	int pan_display;
 	int irq;
 	phys_addr_t bar_physical;
 	size_t reg_size;
@@ -107,8 +108,7 @@ static irqreturn_t handle_int(int irq, void *p)
 	// for VINT version: clr VINT|UNIT (bits [17],[18])
 	iowrite32(0x060000, REG_ADDR(subdev->bar_logical, PDC_REG_SWAP));
 
-	spin_lock(&subdev->int_lock);
-	if (subdev->wait_status == 1) { // user waiting for int/swap
+	if (subdev->pan_display) {
 		next_fba = subdev->fb_pa +
 			   (subdev->info.var.yoffset * subdev->info.var.xres *
 			    (subdev->info.var.bits_per_pixel >> 3));
@@ -120,6 +120,11 @@ static irqreturn_t handle_int(int irq, void *p)
 		rd_data = 1;
 		while (rd_data & 1)
 			rd_data = ioread32(REG_ADDR(subdev->bar_logical, 0x94));
+		subdev->pan_display = 0;
+	}
+
+	spin_lock(&subdev->int_lock);
+	if (subdev->wait_status == 1) { // user waiting for int/swap
 		subdev->wait_status = 2;
 		wake_up_interruptible(&subdev->wait_queue);
 	}
@@ -194,6 +199,20 @@ static int dvfb_blank(int blank, struct fb_info *info)
 	return 0;
 }
 
+static int dvfb_pan_display(struct fb_var_screeninfo *var,
+			    struct fb_info *info)
+{
+	struct fb_subdev *subdev = container_of(info, struct fb_subdev, info);
+
+	if ((var->xoffset != 0) ||
+	    (var->yoffset + info->var.yres > info->var.yres_virtual))
+		return -EINVAL;
+	
+	info->var.yoffset = var->yoffset;
+	subdev->pan_display = 1;
+	return 0;
+}
+
 static int dvfb_ioctl(struct fb_info *info, unsigned int cmd, unsigned long arg)
 {
 	unsigned int ret = 0;
@@ -231,7 +250,7 @@ static struct fb_ops dvfb_ops = {
 	.owner			= THIS_MODULE,
 	.fb_setcolreg		= dvfb_setcolreg,
 	.fb_blank		= dvfb_blank,
-	//.fb_pan_display	= dvfb_pan_display,	TODO
+	.fb_pan_display		= dvfb_pan_display,
 	.fb_fillrect		= cfb_fillrect,
 	.fb_copyarea		= cfb_copyarea,
 	.fb_imageblit		= cfb_imageblit,
@@ -301,7 +320,7 @@ static int pdc_init(struct fb_dev *fb_dev)
 	subdev->info.screen_base = (void __iomem *)subdev->fb_la;
 	subdev->info.fbops = &dvfb_ops;
 	subdev->info.pseudo_palette = subdev->pseudo_palette;
-	subdev->info.flags = FBINFO_DEFAULT;
+	subdev->info.flags = FBINFO_DEFAULT | FBINFO_HWACCEL_YPAN;
 
 	subdev->info.fix = dvfb_fix;
 	subdev->info.fix.smem_start = subdev->fb_pa;
