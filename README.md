@@ -1,7 +1,5 @@
 # DV Kernel Driver
 
-**NOTE:** DV kernel driver is currently re-writing. Current implementation is just for beta-test.
-
 ## HOWTO Build
 
 Edit Makefile and modify `KERNELDIR` and `CROSS_COMPILE` to point to the kernel directory and cross tool respectively. Then run `make`.
