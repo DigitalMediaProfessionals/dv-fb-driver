@@ -38,14 +38,10 @@
 #include <linux/fb.h>
 #include "pdc.h"
 
-//#define USE_DEVTREE
+#define USE_DEVTREE
 #ifndef USE_DEVTREE
-#ifdef DMP_ZC706
 static unsigned int reg_prop[] = { 0x43c10000, 0x100 };
 static int irq_prop = 50;
-#else
-//TODO
-#endif
 #endif
 
 #define REG_ADDR(PA, OF) ((void __iomem *)(PA) + OF)
@@ -293,7 +289,7 @@ static int pdc_init(struct fb_dev *fb_dev)
 {
 	struct fb_subdev *subdev = &fb_dev->subdev[0];
 	int pdc_dim[5];
-	dma_addr_t fb_pa[2];
+	unsigned int fb_pa[2];
 	int ret;
 
 	pdc_dim[0] = width;
@@ -306,7 +302,7 @@ static int pdc_init(struct fb_dev *fb_dev)
 		dev_err(fb_dev->dev, "Failed to allocate FB buffer.\n");
 		return -ENOMEM;
 	}
-	fb_pa[0] = subdev->fb_pa;
+	fb_pa[0] = subdev->fb_pa & 0xffffffff;
 	fb_pa[1] = fb_pa[0] + (width * height * ((bpp == 32) ? 4 : 3));
 
 	pdc_config(subdev->bar_logical, pdc_dim, fb_pa);
@@ -367,8 +363,8 @@ static int pdc_init(struct fb_dev *fb_dev)
 static int dvfb_probe(struct platform_device *pdev, struct device_node *dev_node)
 {
 	struct fb_dev *fb_dev;
-	phys_addr_t reg_base;
-	size_t reg_size;
+	u32 reg_base;
+	u32 reg_size;
 	int i, ret, irq;
 
 	fb_dev = devm_kzalloc(&pdev->dev, sizeof(struct fb_dev), GFP_KERNEL);
@@ -381,17 +377,26 @@ static int dvfb_probe(struct platform_device *pdev, struct device_node *dev_node
 
 #ifdef USE_DEVTREE
 	{
-		const unsigned int *prop = NULL;
-		int pbytes;
-		prop = of_get_property(dev_node, "reg", &pbytes);
-		if ((prop == NULL) || (pbytes < 8)) {
-			dev_err(&pdev->dev, "reg property not found\n");
-			ret = -ENODEV;
-			goto fail_ioremap;
+		struct device_node *parent_node;
+		u32 addr_cells;
+		unsigned int reg_index;
+		parent_node = of_get_parent(dev_node);
+		if (parent_node) {
+			of_property_read_u32(parent_node, "#address-cells",
+					     &addr_cells);
+			reg_index = addr_cells - 1;
+			of_node_put(parent_node);
+			of_property_read_u32_index(dev_node, "reg", reg_index,
+						   &reg_base);
+			reg_index += addr_cells;
+			of_property_read_u32_index(dev_node, "reg", reg_index,
+						   &reg_size);
+		} else {
+			of_property_read_u32_index(dev_node, "reg", 0,
+						   &reg_base);
+			of_property_read_u32_index(dev_node, "reg", 1,
+						   &reg_size);
 		}
-		// note that device-tree property data is big-endian:
-		reg_base = be32_to_cpup(prop);
-		reg_size = be32_to_cpup(prop + 1);
 	}
 #else
 	reg_base = reg_prop[0];
@@ -458,13 +463,7 @@ static int dev_probe(struct platform_device *pdev)
 	struct device_node *dev_node = NULL;
 
 #ifdef USE_DEVTREE
-	dev_node = of_find_compatible_node(NULL, NULL, "DMP_fb,DMP_fb");
-	if (dev_node == NULL) {
-		dev_err(&pdev->dev, "No compatible node found.\n");
-		return -ENODEV;
-	} else {
-		of_node_put(dev_node);
-	}
+	dev_node = pdev->dev.of_node;
 #endif
 
 	err = dvfb_probe(pdev, dev_node);
@@ -505,6 +504,13 @@ static int dev_remove(struct platform_device *pdev)
 	return 0;
 }
 
+#ifdef USE_DEVTREE
+static const struct of_device_id fb_of_ids[] = {
+	{ .compatible = "dmp,pdc" },
+	{ }
+};
+#endif
+
 static struct platform_driver fb_platform_driver = {
 	.probe = dev_probe,
 	.remove = dev_remove,
@@ -512,14 +518,17 @@ static struct platform_driver fb_platform_driver = {
 		{
 			.name = FB_DEV_NAME,
 			.owner = THIS_MODULE,
+#ifdef USE_DEVTREE
+			.of_match_table = fb_of_ids,
+#endif
 		},
 };
 
+#ifndef USE_DEVTREE
 static void dev_release(struct device *dev)
 {
 }
 
-static u64 drm_dma_mask;
 static struct platform_device fb_platform_device = {
 	.name = FB_DEV_NAME,
 	.id = -1,
@@ -527,10 +536,12 @@ static struct platform_device fb_platform_device = {
 	.resource = NULL,
 	.dev =
 		{
-			.dma_mask = &drm_dma_mask,
+			.coherent_dma_mask = DMA_BIT_MASK(32),
+			.dma_mask = &fb_platform_device.dev.coherent_dma_mask,
 			.release = dev_release,
 		},
 };
+#endif
 
 static int __init drm_init(void)
 {
@@ -539,16 +550,22 @@ static int __init drm_init(void)
 	if (ret)
 		return ret;
 
+#ifndef USE_DEVTREE
 	ret = platform_device_register(&fb_platform_device);
-	if (ret)
+	if (ret) {
 		platform_driver_unregister(&fb_platform_driver);
+		return ret;
+	}
+#endif
 
 	return ret;
 }
 
 static void __exit drm_exit(void)
 {
+#ifndef USE_DEVTREE
 	platform_device_unregister(&fb_platform_device);
+#endif
 	platform_driver_unregister(&fb_platform_driver);
 }
 

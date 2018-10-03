@@ -10,7 +10,7 @@ BUILD_DIR := $(shell pwd)
 VERBOSE = 0
 PWD = $(shell pwd)
 MOD = dmp_fb
-ARCH = arm
+ARCH ?= arm
 
 MAKEARCH = $(MAKE) ARCH=$(ARCH) KCPPFLAGS="-D$(BDDEF)" CROSS_COMPILE=$(CROSS_COMPILE)
 
