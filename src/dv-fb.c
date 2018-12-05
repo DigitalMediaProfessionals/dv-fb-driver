@@ -269,11 +269,23 @@ static int allocate_fb(struct fb_dev *fb_dev)
 		fb_dev->dev, alloc_size, &fb_dev->subdev[0].fb_pa, GFP_KERNEL);
 	if (!fb_dev->subdev[0].fb_la) {
 		dev_err(fb_dev->dev, "Can not allocate frame buffer memory.\n");
-		return 1;
+		return -ENOMEM;
 	}
-
+#ifdef CONFIG_ARCH_DMA_ADDR_T_64BIT
+	if ((unsigned long long)fb_dev->subdev[0].fb_pa + alloc_size >
+	    4294967296ull) {
+		dma_free_coherent(
+			fb_dev->dev, alloc_size, fb_dev->subdev[0].fb_la,
+			fb_dev->subdev[0].fb_pa);
+		dev_err(fb_dev->dev,
+			"dma_addr=%llu alloc_size=%llu lies in high memory\n",
+			(unsigned long long)fb_dev->subdev[0].fb_pa,
+			(unsigned long long)alloc_size);
+		return -ENOMEM;
+	}
+#endif
 	pr_info(FB_DEV_NAME ": frame buffer mem allocated at PA: 0x%08x\n",
-		fb_dev->subdev[0].fb_pa);
+		(unsigned int)fb_dev->subdev[0].fb_pa);
 
 	return 0;
 }
@@ -360,7 +372,8 @@ static int pdc_init(struct fb_dev *fb_dev)
 	return 0;
 }
 
-static int dvfb_probe(struct platform_device *pdev, struct device_node *dev_node)
+static int dvfb_probe(struct platform_device *pdev,
+		      struct device_node *dev_node)
 {
 	struct fb_dev *fb_dev;
 	u32 reg_base;
