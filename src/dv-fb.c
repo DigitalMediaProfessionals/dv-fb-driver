@@ -586,5 +586,5 @@ module_init(drm_init);
 module_exit(drm_exit);
 MODULE_DESCRIPTION("simplistic frame buffer");
 MODULE_AUTHOR("Digital Media Professionals Inc.");
-MODULE_VERSION("1.0");
+MODULE_VERSION("7.0.20181214");
 MODULE_LICENSE("GPL");
